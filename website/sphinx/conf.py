@@ -36,6 +36,11 @@ coverage_ignore_classes = [
     "OutputTransform",
     "TemplateModule",
     "url",
+
+    # tornado.websocket
+    "WebSocketProtocol",
+    "WebSocketProtocol13",
+    "WebSocketProtocol76",
     ]
 
 coverage_ignore_functions = [
@@ -43,7 +48,7 @@ coverage_ignore_functions = [
     "doctests",
     "main",
 ]
-    
+
 html_static_path = [os.path.abspath("../static")]
 html_style = "sphinx.css"
 highlight_language = "none"
@@ -69,3 +74,7 @@ html_theme_options = dict(
     headfont="Calibri, sans-serif",
     stickysidebar=True,
     )
+
+latex_documents = [
+    ('index', 'tornado.tex', 'Tornado Documentation', 'Facebook', 'manual', False),
+    ]

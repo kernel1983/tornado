@@ -1,12 +1,16 @@
 #!/usr/bin/env python
 
+
+from __future__ import absolute_import, division, with_statement
 from tornado import httpclient, simple_httpclient, netutil
 from tornado.escape import json_decode, utf8, _unicode, recursive_unicode, native_str
 from tornado.httpserver import HTTPServer
 from tornado.httputil import HTTPHeaders
 from tornado.iostream import IOStream
+from tornado.log import gen_log
 from tornado.simple_httpclient import SimpleAsyncHTTPClient
-from tornado.testing import AsyncHTTPTestCase, LogTrapTestCase, AsyncTestCase
+from tornado.testing import AsyncHTTPTestCase, AsyncHTTPSTestCase, AsyncTestCase, ExpectLog
+from tornado.test.util import unittest
 from tornado.util import b, bytes_type
 from tornado.web import Application, RequestHandler
 import os
@@ -20,44 +24,54 @@ try:
 except ImportError:
     ssl = None
 
+
+class HandlerBaseTestCase(AsyncHTTPTestCase):
+    def get_app(self):
+        return Application([('/', self.__class__.Handler)])
+
+    def fetch_json(self, *args, **kwargs):
+        response = self.fetch(*args, **kwargs)
+        response.rethrow()
+        return json_decode(response.body)
+
+
 class HelloWorldRequestHandler(RequestHandler):
     def initialize(self, protocol="http"):
         self.expected_protocol = protocol
 
     def get(self):
-        assert self.request.protocol == self.expected_protocol
+        if self.request.protocol != self.expected_protocol:
+            raise Exception("unexpected protocol")
         self.finish("Hello world")
 
     def post(self):
         self.finish("Got %d bytes in POST" % len(self.request.body))
 
-class SSLTest(AsyncHTTPTestCase, LogTrapTestCase):
-    def setUp(self):
-        super(SSLTest, self).setUp()
-        # Replace the client defined in the parent class.
-        # Some versions of libcurl have deadlock bugs with ssl,
-        # so always run these tests with SimpleAsyncHTTPClient.
-        self.http_client = SimpleAsyncHTTPClient(io_loop=self.io_loop,
-                                                 force_instance=True)
 
+skipIfNoSSL = unittest.skipIf(ssl is None, "ssl module not present")
+# In pre-1.0 versions of openssl, SSLv23 clients always send SSLv2
+# ClientHello messages, which are rejected by SSLv3 and TLSv1
+# servers.  Note that while the OPENSSL_VERSION_INFO was formally
+# introduced in python3.2, it was present but undocumented in
+# python 2.7
+skipIfOldSSL = unittest.skipIf(
+    getattr(ssl, 'OPENSSL_VERSION_INFO', (0, 0)) < (1, 0),
+    "old version of ssl module and/or openssl")
+
+
+class BaseSSLTest(AsyncHTTPSTestCase):
     def get_app(self):
-        return Application([('/', HelloWorldRequestHandler, 
+        return Application([('/', HelloWorldRequestHandler,
                              dict(protocol="https"))])
 
-    def get_httpserver_options(self):
-        # Testing keys were generated with:
-        # openssl req -new -keyout tornado/test/test.key -out tornado/test/test.crt -nodes -days 3650 -x509
-        test_dir = os.path.dirname(__file__)
-        return dict(ssl_options=dict(
-                certfile=os.path.join(test_dir, 'test.crt'),
-                keyfile=os.path.join(test_dir, 'test.key')))
 
-    def fetch(self, path, **kwargs):
-        self.http_client.fetch(self.get_url(path).replace('http', 'https'),
-                               self.stop,
-                               validate_cert=False,
-                               **kwargs)
-        return self.wait()
+class SSLTestMixin(object):
+    def get_ssl_options(self):
+        return dict(ssl_version=self.get_ssl_version(),
+                    **AsyncHTTPSTestCase.get_ssl_options())
+
+    def get_ssl_version(self):
+        raise NotImplementedError()
 
     def test_ssl(self):
         response = self.fetch('/')
@@ -66,21 +80,71 @@ class SSLTest(AsyncHTTPTestCase, LogTrapTestCase):
     def test_large_post(self):
         response = self.fetch('/',
                               method='POST',
-                              body='A'*5000)
+                              body='A' * 5000)
         self.assertEqual(response.body, b("Got 5000 bytes in POST"))
 
     def test_non_ssl_request(self):
         # Make sure the server closes the connection when it gets a non-ssl
         # connection, rather than waiting for a timeout or otherwise
         # misbehaving.
-        self.http_client.fetch(self.get_url("/"), self.stop,
-                               request_timeout=3600,
-                               connect_timeout=3600)
-        response = self.wait()
+        with ExpectLog(gen_log, '(SSL Error|uncaught exception)'):
+            self.http_client.fetch(self.get_url("/"), self.stop,
+                                   request_timeout=3600,
+                                   connect_timeout=3600)
+            response = self.wait()
         self.assertEqual(response.code, 599)
 
-if ssl is None:
-    del SSLTest
+# Python's SSL implementation differs significantly between versions.
+# For example, SSLv3 and TLSv1 throw an exception if you try to read
+# from the socket before the handshake is complete, but the default
+# of SSLv23 allows it.
+
+
+class SSLv23Test(BaseSSLTest, SSLTestMixin):
+    def get_ssl_version(self):
+        return ssl.PROTOCOL_SSLv23
+SSLv23Test = skipIfNoSSL(SSLv23Test)
+
+
+class SSLv3Test(BaseSSLTest, SSLTestMixin):
+    def get_ssl_version(self):
+        return ssl.PROTOCOL_SSLv3
+SSLv3Test = skipIfNoSSL(skipIfOldSSL(SSLv3Test))
+
+class TLSv1Test(BaseSSLTest, SSLTestMixin):
+    def get_ssl_version(self):
+        return ssl.PROTOCOL_TLSv1
+TLSv1Test = skipIfNoSSL(skipIfOldSSL(TLSv1Test))
+
+
+class BadSSLOptionsTest(unittest.TestCase):
+    def test_missing_arguments(self):
+        application = Application()
+        self.assertRaises(KeyError, HTTPServer, application, ssl_options={
+            "keyfile": "/__missing__.crt",
+        })
+
+    def test_missing_key(self):
+        '''A missing SSL key should cause an immediate exception.'''
+
+        application = Application()
+        module_dir = os.path.dirname(__file__)
+        existing_certificate = os.path.join(module_dir, 'test.crt')
+
+        self.assertRaises(ValueError, HTTPServer, application, ssl_options={
+           "certfile": "/__mising__.crt",
+        })
+        self.assertRaises(ValueError, HTTPServer, application, ssl_options={
+           "certfile": existing_certificate,
+           "keyfile": "/__missing__.key"
+        })
+
+        # This actually works because both files exist
+        server = HTTPServer(application, ssl_options={
+           "certfile": existing_certificate,
+           "keyfile": existing_certificate
+        })
+
 
 class MultipartTestHandler(RequestHandler):
     def post(self):
@@ -90,17 +154,20 @@ class MultipartTestHandler(RequestHandler):
                      "filebody": _unicode(self.request.files["files"][0]["body"]),
                      })
 
+
 class RawRequestHTTPConnection(simple_httpclient._HTTPConnection):
     def set_request(self, request):
         self.__next_request = request
 
-    def _on_connect(self, parsed):
+    def _on_connect(self, parsed, parsed_hostname):
         self.stream.write(self.__next_request)
         self.__next_request = None
         self.stream.read_until(b("\r\n\r\n"), self._on_headers)
 
 # This test is also called from wsgi_test
-class HTTPConnectionTest(AsyncHTTPTestCase, LogTrapTestCase):
+
+
+class HTTPConnectionTest(AsyncHTTPTestCase):
     def get_handlers(self):
         return [("/multipart", MultipartTestHandler),
                 ("/hello", HelloWorldRequestHandler)]
@@ -109,15 +176,17 @@ class HTTPConnectionTest(AsyncHTTPTestCase, LogTrapTestCase):
         return Application(self.get_handlers())
 
     def raw_fetch(self, headers, body):
-        conn = RawRequestHTTPConnection(self.io_loop, self.http_client,
+        client = SimpleAsyncHTTPClient(self.io_loop)
+        conn = RawRequestHTTPConnection(self.io_loop, client,
                                         httpclient.HTTPRequest(self.get_url("/")),
                                         None, self.stop,
-                                        1024*1024)
+                                        1024 * 1024)
         conn.set_request(
             b("\r\n").join(headers +
                            [utf8("Content-Length: %d\r\n" % len(body))]) +
             b("\r\n") + body)
         response = self.wait()
+        client.close()
         response.rethrow()
         return response
 
@@ -154,9 +223,10 @@ class HTTPConnectionTest(AsyncHTTPTestCase, LogTrapTestCase):
         stream.connect(("localhost", self.get_http_port()), callback=self.stop)
         self.wait()
         stream.write(b("\r\n").join([b("POST /hello HTTP/1.1"),
-                                  b("Content-Length: 1024"),
-                                  b("Expect: 100-continue"),
-                                  b("\r\n")]), callback=self.stop)
+                                     b("Content-Length: 1024"),
+                                     b("Expect: 100-continue"),
+                                     b("Connection: close"),
+                                     b("\r\n")]), callback=self.stop)
         self.wait()
         stream.read_until(b("\r\n\r\n"), self.stop)
         data = self.wait()
@@ -171,10 +241,13 @@ class HTTPConnectionTest(AsyncHTTPTestCase, LogTrapTestCase):
         stream.read_bytes(int(headers["Content-Length"]), self.stop)
         body = self.wait()
         self.assertEqual(body, b("Got 1024 bytes in POST"))
+        stream.close()
+
 
 class EchoHandler(RequestHandler):
     def get(self):
         self.write(recursive_unicode(self.request.arguments))
+
 
 class TypeCheckHandler(RequestHandler):
     def prepare(self):
@@ -212,19 +285,26 @@ class TypeCheckHandler(RequestHandler):
     def check_type(self, name, obj, expected_type):
         actual_type = type(obj)
         if expected_type != actual_type:
-            self.errors[name] = "expected %s, got %s" % (expected_type, 
+            self.errors[name] = "expected %s, got %s" % (expected_type,
                                                          actual_type)
 
-class HTTPServerTest(AsyncHTTPTestCase, LogTrapTestCase):
+
+class HTTPServerTest(AsyncHTTPTestCase):
     def get_app(self):
         return Application([("/echo", EchoHandler),
                             ("/typecheck", TypeCheckHandler),
+                            ("//doubleslash", EchoHandler),
                             ])
 
     def test_query_string_encoding(self):
         response = self.fetch("/echo?foo=%C3%A9")
         data = json_decode(response.body)
         self.assertEqual(data, {u"foo": [u"\u00e9"]})
+
+    def test_empty_query_string(self):
+        response = self.fetch("/echo?foo=&foo=")
+        data = json_decode(response.body)
+        self.assertEqual(data, {u"foo": [u"", u""]})
 
     def test_types(self):
         headers = {"Cookie": "foo=bar"}
@@ -236,7 +316,49 @@ class HTTPServerTest(AsyncHTTPTestCase, LogTrapTestCase):
         data = json_decode(response.body)
         self.assertEqual(data, {})
 
-class UnixSocketTest(AsyncTestCase, LogTrapTestCase):
+    def test_double_slash(self):
+        # urlparse.urlsplit (which tornado.httpserver used to use
+        # incorrectly) would parse paths beginning with "//" as
+        # protocol-relative urls.
+        response = self.fetch("//doubleslash")
+        self.assertEqual(200, response.code)
+        self.assertEqual(json_decode(response.body), {})
+
+
+class XHeaderTest(HandlerBaseTestCase):
+    class Handler(RequestHandler):
+        def get(self):
+            self.write(dict(remote_ip=self.request.remote_ip))
+
+    def get_httpserver_options(self):
+        return dict(xheaders=True)
+
+    def test_ip_headers(self):
+        self.assertEqual(self.fetch_json("/")["remote_ip"],
+                         "127.0.0.1")
+
+        valid_ipv4 = {"X-Real-IP": "4.4.4.4"}
+        self.assertEqual(
+            self.fetch_json("/", headers=valid_ipv4)["remote_ip"],
+            "4.4.4.4")
+
+        valid_ipv6 = {"X-Real-IP": "2620:0:1cfe:face:b00c::3"}
+        self.assertEqual(
+            self.fetch_json("/", headers=valid_ipv6)["remote_ip"],
+            "2620:0:1cfe:face:b00c::3")
+
+        invalid_chars = {"X-Real-IP": "4.4.4.4<script>"}
+        self.assertEqual(
+            self.fetch_json("/", headers=invalid_chars)["remote_ip"],
+            "127.0.0.1")
+
+        invalid_host = {"X-Real-IP": "www.google.com"}
+        self.assertEqual(
+            self.fetch_json("/", headers=invalid_host)["remote_ip"],
+            "127.0.0.1")
+
+
+class UnixSocketTest(AsyncTestCase):
     """HTTPServers can listen on Unix sockets too.
 
     Why would you want to do this?  Nginx can proxy to backends listening
@@ -272,6 +394,8 @@ class UnixSocketTest(AsyncTestCase, LogTrapTestCase):
         stream.read_bytes(int(headers["Content-Length"]), self.stop)
         body = self.wait()
         self.assertEqual(body, b("Hello world"))
-
-if not hasattr(socket, 'AF_UNIX') or sys.platform == 'cygwin':
-    del UnixSocketTest
+        stream.close()
+        server.stop()
+UnixSocketTest = unittest.skipIf(
+    not hasattr(socket, 'AF_UNIX') or sys.platform == 'cygwin',
+    "unix sockets not supported on this platform")

@@ -39,7 +39,7 @@ class Application(tornado.web.Application):
             (r"/chatsocket", ChatSocketHandler),
         ]
         settings = dict(
-            cookie_secret="43oETzKXQAGaYdkL5gEmGeJJFuYh7EQnp2XdTP1o/Vo=",
+            cookie_secret="__TODO:_GENERATE_YOUR_OWN_RANDOM_VALUE_HERE__",
             template_path=os.path.join(os.path.dirname(__file__), "templates"),
             static_path=os.path.join(os.path.dirname(__file__), "static"),
             xsrf_cookies=True,
@@ -56,6 +56,10 @@ class ChatSocketHandler(tornado.websocket.WebSocketHandler):
     waiters = set()
     cache = []
     cache_size = 200
+
+    def allow_draft76(self):
+        # for iOS 5.0 Safari
+        return True
 
     def open(self):
         ChatSocketHandler.waiters.add(self)
